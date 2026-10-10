@@ -585,7 +585,62 @@ function Show-SwMenu {
     Write-Host "`n   [ Q] Quit" -ForegroundColor Red
 }
 
+function Show-SwMatrixIntro {
+    # A short "Matrix" green-rain intro. Press any key to skip. Never blocks the
+    # real work: if the console can't do it (e.g. ISE, no window), it just skips.
+    param([int]$Seconds = 3)
+    try {
+        $w = [Console]::WindowWidth
+        $h = [Console]::WindowHeight
+        if ($w -lt 20 -or $h -lt 8) { return }
+        $maxX = [Math]::Min($w - 2, 118)   # leave the last column free (avoids scrolling)
+        $maxY = [Math]::Min($h - 2, 38)    # leave the last row free
+        $chars = 'ｱｲｳｴｵｶｷｸ0123456789@#$%&*<>=/|'.ToCharArray()
+        $cols = 0..$maxX
+        $head = @{}; $speed = @{}
+        foreach ($c in $cols) { $head[$c] = Get-Random -Minimum (-$maxY) -Maximum 1; $speed[$c] = Get-Random -Minimum 1 -Maximum 3 }
+        $tail = 7
+        [Console]::CursorVisible = $false
+        Clear-Host
+        $end = (Get-Date).AddSeconds($Seconds)
+        $frame = 0
+        while ((Get-Date) -lt $end) {
+            foreach ($c in $cols) {
+                if (($frame % $speed[$c]) -ne 0) { continue }
+                $r = $head[$c]
+                if ($r -ge 0 -and $r -le $maxY) {
+                    [Console]::SetCursorPosition($c, $r); [Console]::ForegroundColor = 'White'
+                    [Console]::Write($chars[(Get-Random -Maximum $chars.Count)])
+                }
+                $tr = $r - 1
+                if ($tr -ge 0 -and $tr -le $maxY) {
+                    [Console]::SetCursorPosition($c, $tr); [Console]::ForegroundColor = 'Green'
+                    [Console]::Write($chars[(Get-Random -Maximum $chars.Count)])
+                }
+                $er = $r - $tail
+                if ($er -ge 0 -and $er -le $maxY) { [Console]::SetCursorPosition($c, $er); [Console]::Write(' ') }
+                $head[$c] = $r + 1
+                if (($head[$c] - $tail) -gt $maxY) { $head[$c] = Get-Random -Minimum (-$maxY) -Maximum 1 }
+            }
+            Start-Sleep -Milliseconds 45
+            $frame++
+            if ([Console]::KeyAvailable) { [void][Console]::ReadKey($true); break }
+        }
+        # "wake up" flourish
+        [Console]::ForegroundColor = 'Green'
+        $msg = 'SIMONWARE'
+        $x = [Math]::Max(0, [int](($w - $msg.Length) / 2)); $y = [int]($maxY / 2)
+        [Console]::SetCursorPosition($x, $y); [Console]::Write($msg)
+        Start-Sleep -Milliseconds 650
+    }
+    catch { }
+    finally {
+        try { [Console]::ResetColor(); [Console]::CursorVisible = $true; Clear-Host } catch { }
+    }
+}
+
 function Invoke-SimonwareSetup {
+    Show-SwMatrixIntro
     if (-not (Test-SwAdmin)) {
         Write-SwBad 'Please open PowerShell as Administrator and run this again.'
         return
