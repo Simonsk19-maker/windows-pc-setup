@@ -16,6 +16,10 @@ function New-SwConfig {
     [ordered]@{
         TimeZone          = 'GMT Standard Time'
 
+        # Branding
+        ComputerNamePrefix = 'SMASH-'   # suggested when renaming a PC ('' = no prefix)
+        WallpaperUrl       = 'https://raw.githubusercontent.com/Simonsk19-maker/windows-pc-setup/main/assets/Simonware-Wallpaper.png'
+
         # Installed with winget by "Install standard apps"
         StandardApps      = @('Google.Chrome', 'Adobe.Acrobat.Reader.64-bit', '7zip.7zip')
 
@@ -155,9 +159,16 @@ function Update-SwApps {
 }
 
 function Rename-SwComputer {
-    param([string]$NewName)
+    param([string]$NewName, [string]$Prefix = '')
     Write-SwTitle 'Renaming this PC'
-    if (-not $NewName) { $NewName = (Read-Host "  New PC name (now $env:COMPUTERNAME, Enter to skip)").Trim() }
+    if (-not $NewName) {
+        if ($Prefix) {
+            $rest = (Read-Host "  New PC name. I'll add '$Prefix' - enter the rest (e.g. 01 or RECEPTION), or Enter to skip").Trim()
+            if ($rest) { $NewName = if ($rest -like "$Prefix*") { $rest } else { "$Prefix$rest" } }
+        } else {
+            $NewName = (Read-Host "  New PC name (now $env:COMPUTERNAME, Enter to skip)").Trim()
+        }
+    }
     if (-not $NewName) { Write-SwInfo 'Skipped.'; return }
     if ($NewName -notmatch '^(?![0-9]+$)[A-Za-z0-9-]{1,15}$') {
         Write-SwBad 'Name must be 1-15 letters, numbers or hyphens, and not only numbers.'
@@ -372,6 +383,38 @@ function Set-SwPerformance {
     Write-SwGood "Done for $env:USERNAME. Shows after sign out or Explorer restart."
 }
 
+function Set-SwWallpaper {
+    param($Config)
+    Write-SwTitle 'Setting the Smash-It-IT wallpaper'
+    if (-not $Config.WallpaperUrl) { Write-SwInfo 'No wallpaper set in the config. Skipped.'; return }
+    $folder = Join-Path $env:ProgramData 'Simonware'
+    New-Item -Path $folder -ItemType Directory -Force | Out-Null
+    $dest = Join-Path $folder 'wallpaper.png'
+    try {
+        [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+        $ProgressPreference = 'SilentlyContinue'
+        Invoke-WebRequest -Uri $Config.WallpaperUrl -OutFile $dest -UseBasicParsing -ErrorAction Stop
+    }
+    catch { Write-SwWarn "Couldn't download the wallpaper: $($_.Exception.Message)"; return }
+
+    # Save the choice, then apply it now for the current user
+    Set-SwRegistry 'HKCU:\Control Panel\Desktop' 'Wallpaper' $dest 'String'
+    Set-SwRegistry 'HKCU:\Control Panel\Desktop' 'WallpaperStyle' '10' 'String'   # 10 = fill
+    Set-SwRegistry 'HKCU:\Control Panel\Desktop' 'TileWallpaper' '0' 'String'
+    if (-not ('SwWallpaper' -as [type])) {
+        Add-Type -TypeDefinition @'
+using System.Runtime.InteropServices;
+public static class SwWallpaper {
+    [DllImport("user32.dll", SetLastError = true, CharSet = CharSet.Auto)]
+    public static extern bool SystemParametersInfo(int uAction, int uParam, string lpvParam, int fuWinIni);
+}
+'@
+    }
+    # 20 = SPI_SETDESKWALLPAPER, 3 = update + tell other programs
+    [void][SwWallpaper]::SystemParametersInfo(20, 0, $dest, 3)
+    Write-SwGood 'Wallpaper set for this user. (New user accounts keep the Windows default.)'
+}
+
 function Set-SwTaskbar {
     Write-SwTitle 'Tidying the taskbar (widgets and Task View off)'
     # Official policy: turns off Widgets for everyone
@@ -478,13 +521,21 @@ function Restart-SwExplorer {
 function Start-SwFullSetup {
     param($Config)
     Write-SwTitle 'Full new PC setup - a few questions first'
+    $nameRest = if ($Config.ComputerNamePrefix) {
+        (Read-Host "  New PC name. I'll add '$($Config.ComputerNamePrefix)' - enter the rest (e.g. 01), or Enter to keep").Trim()
+    } else {
+        (Read-Host "  New PC name (now $env:COMPUTERNAME, Enter to keep)").Trim()
+    }
+    $newName = ''
+    if ($nameRest) { $newName = if ($Config.ComputerNamePrefix -and $nameRest -notlike "$($Config.ComputerNamePrefix)*") { "$($Config.ComputerNamePrefix)$nameRest" } else { $nameRest } }
     $answers = [ordered]@{
-        NewName        = (Read-Host "  New PC name (now $env:COMPUTERNAME, Enter to keep)").Trim()
+        NewName        = $newName
         RemoveXbox     = Read-SwYesNo 'Remove Xbox apps? (say No for gaming PCs)' $false
         Office         = Read-SwYesNo 'Install Microsoft 365 Apps (64-bit)?' $true
         DotNet         = Read-SwYesNo 'Turn on .NET Framework 3.5?' $false
         Passwords      = Read-SwYesNo 'Apply the recommended password policy?' $false
         Splashtop      = Read-SwYesNo 'Put Splashtop SOS on the desktop?' $true
+        Wallpaper      = Read-SwYesNo 'Set the Smash-It-IT wallpaper?' $true
     }
     Write-SwInfo 'Thanks. The rest runs on its own.'
 
@@ -504,6 +555,7 @@ function Start-SwFullSetup {
     $steps.Add(@{ Name = 'AutoPlay off';         Run = { Set-SwAutoplay -On $false } })
     $steps.Add(@{ Name = 'Browser welcome off';  Run = { Set-SwBrowserFirstRun } })
     $steps.Add(@{ Name = 'Visual effects';       Run = { Set-SwPerformance } })
+    if ($answers.Wallpaper) { $steps.Add(@{ Name = 'Smash-It-IT wallpaper'; Run = { Set-SwWallpaper $Config } }) }
     if ($answers.Passwords) { $steps.Add(@{ Name = 'Password policy'; Run = { Set-SwPasswordPolicy $Config -Preset 'Recommended' } }) }
     $steps.Add(@{ Name = 'Early updates on';     Run = { Set-SwEarlyUpdates -On $true } })
     $steps.Add(@{ Name = 'Windows updates';      Run = { Install-SwWindowsUpdates } })
@@ -525,8 +577,19 @@ function Start-SwFullSetup {
 
     Write-SwTitle 'Setup summary'
     $results | Format-Table -AutoSize | Out-Host
+    $ok = @($results | Where-Object Result -eq 'OK').Count
     $failed = @($results | Where-Object Result -eq 'FAILED').Count
-    if ($failed) { Write-SwWarn "$failed step(s) failed. Run them again from the menu." } else { Write-SwGood 'Every step finished.' }
+
+    Write-Host ''
+    Write-Host '  ================================================' -ForegroundColor Green
+    Write-Host '              S E T U P   C O M P L E T E' -ForegroundColor Green
+    Write-Host '  ================================================' -ForegroundColor Green
+    Write-Host "   PC name:   $env:COMPUTERNAME" -ForegroundColor Gray
+    if ($answers.NewName) { Write-Host "   New name:  $($answers.NewName) (after restart)" -ForegroundColor Gray }
+    Write-Host "   Steps OK:  $ok of $($results.Count)" -ForegroundColor Gray
+    if ($failed) { Write-SwWarn "$failed step(s) failed - run them again from the menu." } else { Write-SwGood 'Every step finished.' }
+    Write-Host '   Smash-It-IT' -ForegroundColor DarkGreen
+    Write-Host ''
 
     if (Read-SwYesNo 'Restart the PC now to finish?' $true) { Restart-Computer -Force } else { Restart-SwExplorer }
 }
@@ -540,7 +603,7 @@ function Get-SwMenu {
     @(
         @{ Key = 'A';  Group = 'Automatic';         Name = 'Full new PC setup';                    Run = { Start-SwFullSetup $Config } }
         @{ Key = '1';  Group = 'Basics';            Name = 'Update all apps';                      Run = { Update-SwApps } }
-        @{ Key = '2';  Group = 'Basics';            Name = 'Rename this PC';                       Run = { Rename-SwComputer } }
+        @{ Key = '2';  Group = 'Basics';            Name = 'Rename this PC';                       Run = { Rename-SwComputer -Prefix $Config.ComputerNamePrefix } }
         @{ Key = '3';  Group = 'Basics';            Name = 'Set time zone and sync clock';         Run = { Set-SwClock $Config } }
         @{ Key = '4';  Group = 'Basics';            Name = 'Turn on Remote Desktop';               Run = { Enable-SwRemoteDesktop } }
         @{ Key = '5';  Group = 'Basics';            Name = 'Join a domain';                        Run = { Join-SwDomain } }
@@ -564,6 +627,7 @@ function Get-SwMenu {
         @{ Key = '23'; Group = 'Look and feel';     Name = 'Visual effects for speed';             Run = { Set-SwPerformance } }
         @{ Key = '24'; Group = 'Look and feel';     Name = 'Power options';                        Run = { Set-SwPower $Config } }
         @{ Key = '25'; Group = 'Look and feel';     Name = 'Restart Explorer';                     Run = { Restart-SwExplorer } }
+        @{ Key = '29'; Group = 'Look and feel';     Name = 'Set the Smash-It-IT wallpaper';        Run = { Set-SwWallpaper $Config } }
         @{ Key = '26'; Group = 'Passwords';         Name = 'Make a strong password';               Run = { New-SwPassword } }
         @{ Key = '27'; Group = 'Passwords';         Name = 'Password policy: recommended';         Run = { Set-SwPasswordPolicy $Config -Preset 'Recommended' } }
         @{ Key = '28'; Group = 'Passwords';         Name = 'Password policy: Windows default';     Run = { Set-SwPasswordPolicy $Config -Preset 'WindowsDefault' } }
