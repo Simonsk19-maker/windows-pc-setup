@@ -19,6 +19,7 @@ function New-SwConfig {
         # Branding
         ComputerNamePrefix = 'SMASH-'   # suggested when renaming a PC ('' = no prefix)
         WallpaperUrl       = 'https://raw.githubusercontent.com/Simonsk19-maker/windows-pc-setup/main/assets/Simonware-Wallpaper.png'
+        WorkgroupName      = 'WORKGROUP' # suggested when setting a workgroup on a non-domain PC
 
         # Installed with winget by "Install standard apps"
         StandardApps      = @('Google.Chrome', 'Adobe.Acrobat.Reader.64-bit', '7zip.7zip')
@@ -458,8 +459,8 @@ function Get-SwRandomNumber {
     return [int]($value % $Max)
 }
 
-function New-SwPassword {
-    Write-SwTitle 'New password'
+function Get-SwPasswordString {
+    # Builds one strong, easy-to-read password (three words + number + symbol).
     $words = 'Anchor Badger Banjo Biscuit Breeze Cactus Canyon Comet Copper Cricket Dynamo Ember Falcon Fjord Galaxy Glacier Granite Harbour Hazel Igloo Jigsaw Kettle Lantern Lemon Magnet Maple Meadow Nebula Nutmeg Orbit Otter Pebble Pepper Piano Pixel Quartz Raven Rocket Saffron Sapphire Summit Tango Thistle Tornado Velvet Walnut Willow Yonder Zephyr' -split ' '
     $symbols = '!', '#', '%', '*', '?', '@'
     do {
@@ -467,6 +468,12 @@ function New-SwPassword {
         $password += '{0:D2}' -f (Get-SwRandomNumber 100)
         $password += $symbols[(Get-SwRandomNumber $symbols.Count)]
     } while ($password.Length -lt 16)
+    return $password
+}
+
+function New-SwPassword {
+    Write-SwTitle 'New password'
+    $password = Get-SwPasswordString
     Write-Host ''
     Write-Host "    $password" -ForegroundColor Green
     Write-Host ''
@@ -514,13 +521,102 @@ function Restart-SwExplorer {
     Write-SwGood 'Explorer restarted.'
 }
 
-# =====================================================================
-#  FULL AUTOMATIC SETUP
-# =====================================================================
+function New-SwLocalUser {
+    Write-SwTitle 'Create a local user'
+    if ((Get-CimInstance Win32_ComputerSystem).PartOfDomain) {
+        Write-SwWarn 'This PC is on a domain - add domain users in Active Directory instead. Carrying on with a local account.'
+    }
+    $name = (Read-Host '  User name (no spaces, Enter to skip)').Trim()
+    if (-not $name) { Write-SwInfo 'Skipped.'; return }
+    if ($name -notmatch '^[A-Za-z0-9._-]{1,20}$') {
+        Write-SwBad 'Name must be 1-20 letters, numbers, dots, hyphens or underscores (no spaces).'
+        return
+    }
+    if (Get-LocalUser -Name $name -ErrorAction SilentlyContinue) {
+        Write-SwBad "A user called '$name' already exists."
+        return
+    }
+    $fullName = (Read-Host "  Full name (Enter to use '$name')").Trim()
+    if (-not $fullName) { $fullName = $name }
 
-function Start-SwFullSetup {
+    $secure = Read-Host '  Password (leave blank and I will make a strong one)' -AsSecureString
+    $madeOne = $false; $plain = ''
+    if ($secure.Length -eq 0) {
+        $plain = Get-SwPasswordString
+        $secure = ConvertTo-SecureString $plain -AsPlainText -Force
+        $madeOne = $true
+    }
+
+    $admin = Read-SwYesNo 'Make this an administrator? (say No for a normal day-to-day account)' $false
+    New-LocalUser -Name $name -FullName $fullName -Password $secure -AccountNeverExpires -ErrorAction Stop | Out-Null
+    Add-LocalGroupMember -Group 'Users' -Member $name -ErrorAction SilentlyContinue
+    if ($admin) { Add-LocalGroupMember -Group 'Administrators' -Member $name -ErrorAction SilentlyContinue }
+
+    $type = if ($admin) { 'administrator' } else { 'standard' }
+    if ($madeOne) {
+        Write-Host ''
+        Write-Host "    User:     $name" -ForegroundColor Green
+        Write-Host "    Password: $plain" -ForegroundColor Green
+        Write-Host ''
+        try { Set-Clipboard -Value $plain; Write-SwInfo 'Password copied to the clipboard.' } catch { }
+    }
+    Write-SwGood "Created $type account '$name'."
+}
+
+function Set-SwWorkgroup {
     param($Config)
-    Write-SwTitle 'Full new PC setup - a few questions first'
+    Write-SwTitle 'Set the workgroup (for PCs with no domain)'
+    $system = Get-CimInstance Win32_ComputerSystem
+    if ($system.PartOfDomain) {
+        Write-SwWarn "This PC is on the domain '$($system.Domain)'. Setting a workgroup removes it from the domain."
+        if (-not (Read-SwYesNo 'Carry on and set a workgroup anyway?' $false)) { Write-SwInfo 'Skipped.'; return }
+    }
+    $default = if ($Config.WorkgroupName) { $Config.WorkgroupName } else { 'WORKGROUP' }
+    $name = (Read-Host "  Workgroup name (now '$($system.Workgroup)', Enter for '$default')").Trim()
+    if (-not $name) { $name = $default }
+    if ($name -notmatch '^[A-Za-z0-9-]{1,15}$') {
+        Write-SwBad 'Workgroup must be 1-15 letters, numbers or hyphens.'
+        return
+    }
+    Add-Computer -WorkGroupName $name -Force -ErrorAction Stop
+    Write-SwGood "Workgroup set to $name. Restart to finish."
+}
+
+function Add-SwPrinter {
+    Write-SwTitle 'Install a printer'
+    Write-SwInfo 'I can add a network printer by its IP, or open the normal Windows wizard.'
+    if (-not (Read-SwYesNo 'Add a network printer by IP address? (No opens the wizard)' $true)) {
+        Start-Process rundll32.exe 'printui.dll,PrintUIEntry /im'
+        Write-SwInfo 'Opened the Windows "Add printer" wizard.'
+        return
+    }
+    $ip = (Read-Host '  Printer IP address (e.g. 192.168.1.50)').Trim()
+    if ($ip -notmatch '^((25[0-5]|2[0-4]\d|1?\d?\d)\.){3}(25[0-5]|2[0-4]\d|1?\d?\d)$') {
+        Write-SwBad 'That does not look like an IP address.'
+        return
+    }
+    $portName = "IP_$ip"
+    if (Get-PrinterPort -Name $portName -ErrorAction SilentlyContinue) {
+        Write-SwInfo "A port for $ip already exists."
+    } else {
+        Add-PrinterPort -Name $portName -PrinterHostAddress $ip -ErrorAction Stop
+        Write-SwGood "Made a network port for $ip."
+    }
+    $name = (Read-Host "  Printer name (Enter for 'Network Printer $ip')").Trim()
+    if (-not $name) { $name = "Network Printer $ip" }
+    $driver = (Read-Host '  Driver name exactly as Windows lists it (Enter to pick in the wizard)').Trim()
+    if ($driver -and (Get-PrinterDriver -Name $driver -ErrorAction SilentlyContinue)) {
+        Add-Printer -Name $name -DriverName $driver -PortName $portName -ErrorAction Stop
+        Write-SwGood "Installed '$name' on $ip."
+        return
+    }
+    if ($driver) { Write-SwWarn "Driver '$driver' is not installed yet." }
+    Write-SwInfo "Opening the wizard - choose your printer model and pick the port I made: $portName"
+    Start-Process rundll32.exe 'printui.dll,PrintUIEntry /im'
+}
+
+function Get-SwFullSetupAnswers {
+    param($Config)
     $nameRest = if ($Config.ComputerNamePrefix) {
         (Read-Host "  New PC name. I'll add '$($Config.ComputerNamePrefix)' - enter the rest (e.g. 01), or Enter to keep").Trim()
     } else {
@@ -528,14 +624,60 @@ function Start-SwFullSetup {
     }
     $newName = ''
     if ($nameRest) { $newName = if ($Config.ComputerNamePrefix -and $nameRest -notlike "$($Config.ComputerNamePrefix)*") { "$($Config.ComputerNamePrefix)$nameRest" } else { $nameRest } }
-    $answers = [ordered]@{
-        NewName        = $newName
-        RemoveXbox     = Read-SwYesNo 'Remove Xbox apps? (say No for gaming PCs)' $false
-        Office         = Read-SwYesNo 'Install Microsoft 365 Apps (64-bit)?' $true
-        DotNet         = Read-SwYesNo 'Turn on .NET Framework 3.5?' $false
-        Passwords      = Read-SwYesNo 'Apply the recommended password policy?' $false
-        Splashtop      = Read-SwYesNo 'Put Splashtop SOS on the desktop?' $true
-        Wallpaper      = Read-SwYesNo 'Set the Smash-It-IT wallpaper?' $true
+    [ordered]@{
+        NewName    = $newName
+        RemoveXbox = Read-SwYesNo 'Remove Xbox apps? (say No for gaming PCs)' $false
+        Office     = Read-SwYesNo 'Install Microsoft 365 Apps (64-bit)?' $true
+        DotNet     = Read-SwYesNo 'Turn on .NET Framework 3.5?' $false
+        Passwords  = Read-SwYesNo 'Apply the recommended password policy?' $false
+        Splashtop  = Read-SwYesNo 'Put Splashtop SOS on the desktop?' $true
+        Wallpaper  = Read-SwYesNo 'Set the Smash-It-IT wallpaper?' $true
+    }
+}
+
+function Export-SwProfile {
+    param($Config)
+    Write-SwTitle 'Save a setup profile'
+    Write-SwInfo 'Answer the setup questions once. I save your answers to a file so you can'
+    Write-SwInfo 'load it on the next PC and run the whole setup with no questions.'
+    $answers = Get-SwFullSetupAnswers $Config
+    $default = Join-Path ([Environment]::GetFolderPath('Desktop')) 'Simonware-Profile.json'
+    $path = (Read-Host "  Save to (Enter for $default)").Trim()
+    if (-not $path) { $path = $default }
+    if ($path -notmatch '\.json$') { $path = "$path.json" }
+    $answers | ConvertTo-Json | Set-Content -Path $path -Encoding UTF8 -ErrorAction Stop
+    Write-SwGood "Saved profile to $path"
+    Write-SwInfo 'Tip: put it on a USB stick to carry between PCs.'
+}
+
+function Import-SwProfile {
+    param($Config)
+    Write-SwTitle 'Load a setup profile'
+    $default = Join-Path ([Environment]::GetFolderPath('Desktop')) 'Simonware-Profile.json'
+    $path = (Read-Host "  Profile file (Enter for $default)").Trim()
+    if (-not $path) { $path = $default }
+    if (-not (Test-Path $path)) { Write-SwBad "No file at $path"; return }
+    try { $answers = Get-Content -Path $path -Raw | ConvertFrom-Json }
+    catch { Write-SwBad 'That file is not a valid profile.'; return }
+    Write-SwInfo 'Loaded. Here is what it will do:'
+    $answers | Format-List | Out-Host
+    if (Read-SwYesNo 'Run the full setup now with these answers?' $true) {
+        Start-SwFullSetup -Config $Config -Answers $answers
+    } else { Write-SwInfo 'Cancelled.' }
+}
+
+# =====================================================================
+#  FULL AUTOMATIC SETUP
+# =====================================================================
+
+function Start-SwFullSetup {
+    param($Config, $Answers)
+    Write-SwTitle 'Full new PC setup'
+    if ($Answers) {
+        $answers = $Answers
+        Write-SwInfo 'Using a saved setup profile - no questions needed.'
+    } else {
+        $answers = Get-SwFullSetupAnswers $Config
     }
     Write-SwInfo 'Thanks. The rest runs on its own.'
 
@@ -607,6 +749,8 @@ function Get-SwMenu {
         @{ Key = '3';  Group = 'Basics';            Name = 'Set time zone and sync clock';         Run = { Set-SwClock $Config } }
         @{ Key = '4';  Group = 'Basics';            Name = 'Turn on Remote Desktop';               Run = { Enable-SwRemoteDesktop } }
         @{ Key = '5';  Group = 'Basics';            Name = 'Join a domain';                        Run = { Join-SwDomain } }
+        @{ Key = '31'; Group = 'Basics';            Name = 'Set the workgroup (no domain)';        Run = { Set-SwWorkgroup $Config } }
+        @{ Key = '30'; Group = 'Basics';            Name = 'Create a local user';                  Run = { New-SwLocalUser } }
         @{ Key = '6';  Group = 'Apps';              Name = 'Remove bloatware';                     Run = { Remove-SwBloatware $Config } }
         @{ Key = '7';  Group = 'Apps';              Name = 'Install standard apps';                Run = { Install-SwStandardApps $Config } }
         @{ Key = '8';  Group = 'Apps';              Name = 'Install Microsoft 365 Apps (64-bit)';  Run = { Install-SwOffice $Config -Bits '64' } }
@@ -631,6 +775,9 @@ function Get-SwMenu {
         @{ Key = '26'; Group = 'Passwords';         Name = 'Make a strong password';               Run = { New-SwPassword } }
         @{ Key = '27'; Group = 'Passwords';         Name = 'Password policy: recommended';         Run = { Set-SwPasswordPolicy $Config -Preset 'Recommended' } }
         @{ Key = '28'; Group = 'Passwords';         Name = 'Password policy: Windows default';     Run = { Set-SwPasswordPolicy $Config -Preset 'WindowsDefault' } }
+        @{ Key = '32'; Group = 'Printers';          Name = 'Install a printer';                    Run = { Add-SwPrinter } }
+        @{ Key = '33'; Group = 'Profiles';          Name = 'Save a setup profile to a file';       Run = { Export-SwProfile $Config } }
+        @{ Key = '34'; Group = 'Profiles';          Name = 'Load a setup profile from a file';     Run = { Import-SwProfile $Config } }
         @{ Key = 'R';  Group = 'Finish';            Name = 'Restart the PC';                       Run = { if (Read-SwYesNo 'Restart now?' $false) { Restart-Computer -Force } } }
     )
 }
