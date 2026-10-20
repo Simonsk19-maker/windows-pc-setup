@@ -6,7 +6,23 @@
 
     Every run is logged to C:\ProgramData\Simonware\Logs.
     Change the settings in New-SwConfig to suit your customers.
+
+    BATCH / NETWORK MODE (for several PCs on one network):
+      From the menu, "Set up a network share for batch setup" saves your answers
+      and a copy of this script to a shared folder. Then on each new PC you just
+      run Run-Setup.cmd from that share (as Administrator) - no questions asked.
+      Under the bonnet that calls:
+        Simonware-Setup.ps1 -ProfilePath <path-to-Simonware-Profile.json> -Unattended
 #>
+
+param(
+    # Path to a saved Simonware-Profile.json. If given, the full setup runs from
+    # it instead of showing the menu. Used by the network/batch share.
+    [string]$ProfilePath,
+
+    # Run the full setup with no prompts at all (needs -ProfilePath). For batch runs.
+    [switch]$Unattended
+)
 
 # =====================================================================
 #  SETTINGS
@@ -666,6 +682,99 @@ function Import-SwProfile {
     } else { Write-SwInfo 'Cancelled.' }
 }
 
+function Set-SwBatchShare {
+    # Prepares a shared folder so several PCs on the same network can be set up
+    # with one click each (Run-Setup.cmd), using the same saved answers.
+    param($Config)
+    Write-SwTitle 'Set up a network share for batch setup'
+    Write-SwInfo 'Do this once. Then on each new PC, open the share and run'
+    Write-SwInfo 'Run-Setup.cmd as Administrator - no questions, the same setup every time.'
+    Write-Host ''
+
+    $share = (Read-Host '  Shared folder (e.g. \\SERVER\Setup or a mapped drive like S:\Setup)').Trim().Trim('"')
+    if (-not $share) { Write-SwWarn 'No folder given - cancelled.'; return }
+    try {
+        if (-not (Test-Path $share)) { New-Item -Path $share -ItemType Directory -Force -ErrorAction Stop | Out-Null }
+        $probe = Join-Path $share '.sw-write-test'
+        Set-Content -Path $probe -Value 'ok' -ErrorAction Stop
+        Remove-Item $probe -ErrorAction SilentlyContinue
+    } catch { Write-SwBad "Can't write to $share - check the path and that you have access."; return }
+    Write-SwGood "Folder is ready and writable: $share"
+
+    # 1) The answers - reuse an existing profile or make one now
+    $profilePath = Join-Path $share 'Simonware-Profile.json'
+    if ((Test-Path $profilePath) -and (Read-SwYesNo 'A profile already exists in the share. Keep it?' $true)) {
+        Write-SwInfo 'Keeping the existing profile.'
+    } else {
+        Write-SwInfo 'Answer the setup questions once - they will be reused on every PC.'
+        $answers = Get-SwFullSetupAnswers $Config
+        try { $answers | ConvertTo-Json | Set-Content -Path $profilePath -Encoding UTF8 -ErrorAction Stop }
+        catch { Write-SwBad "Couldn't save the profile: $($_.Exception.Message)"; return }
+        Write-SwGood "Saved answers to $profilePath"
+    }
+
+    # 2) A copy of this script in the share (download the latest from GitHub)
+    $scriptPath = Join-Path $share 'Simonware-Setup.ps1'
+    $rawUrl = 'https://raw.githubusercontent.com/Simonsk19-maker/windows-pc-setup/main/Simonware-Setup.ps1'
+    $copied = $false
+    if ($PSCommandPath -and (Test-Path $PSCommandPath)) {
+        try { Copy-Item -Path $PSCommandPath -Destination $scriptPath -Force -ErrorAction Stop; $copied = $true } catch { }
+    }
+    if (-not $copied) {
+        try {
+            [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+            Invoke-WebRequest -Uri $rawUrl -OutFile $scriptPath -UseBasicParsing -ErrorAction Stop
+            $copied = $true
+        } catch { Write-SwBad "Couldn't copy the setup script to the share: $($_.Exception.Message)"; return }
+    }
+    Write-SwGood "Copied the setup script to $scriptPath"
+
+    # 3) A one-click launcher (right-click > Run as administrator on each PC)
+    $cmdPath = Join-Path $share 'Run-Setup.cmd'
+    $cmd = @'
+@echo off
+REM Simonware batch setup - right-click this file and choose "Run as administrator".
+REM It runs the full setup on THIS PC using the saved answers in this folder.
+net session >nul 2>&1
+if %errorlevel% NEQ 0 (
+  echo Please right-click Run-Setup.cmd and choose "Run as administrator".
+  pause
+  exit /b 1
+)
+powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0Simonware-Setup.ps1" -ProfilePath "%~dp0Simonware-Profile.json" -Unattended
+pause
+'@
+    try { Set-Content -Path $cmdPath -Value $cmd -Encoding ASCII -ErrorAction Stop }
+    catch { Write-SwBad "Couldn't write Run-Setup.cmd: $($_.Exception.Message)"; return }
+    Write-SwGood "Made the one-click launcher: $cmdPath"
+
+    # 4) A plain instructions file
+    $readmePath = Join-Path $share 'READ ME - how to set up each PC.txt'
+    $readme = @"
+Simonware - batch PC setup
+==========================
+
+Everything here is ready. To set up each new PC on this network:
+
+  1. Open this shared folder on the new PC.
+  2. Right-click  Run-Setup.cmd  and choose  "Run as administrator".
+  3. Leave it to run. It does the full setup with the saved answers - no questions.
+
+Do the same on every PC. They all get the identical setup.
+
+To change the setup for future PCs, run the Simonware menu again and pick
+"Set up a network share for batch setup", then re-answer the questions.
+
+(Advanced: Run-Setup.cmd simply runs
+   Simonware-Setup.ps1 -ProfilePath Simonware-Profile.json -Unattended )
+"@
+    try { Set-Content -Path $readmePath -Value $readme -Encoding UTF8 -ErrorAction Stop } catch { }
+
+    Write-Host ''
+    Write-SwGood 'Network share is ready.'
+    Write-SwInfo 'On each new PC: open the share, right-click Run-Setup.cmd, Run as administrator.'
+}
+
 # =====================================================================
 #  FULL AUTOMATIC SETUP
 # =====================================================================
@@ -778,6 +887,7 @@ function Get-SwMenu {
         @{ Key = '32'; Group = 'Printers';          Name = 'Install a printer';                    Run = { Add-SwPrinter } }
         @{ Key = '33'; Group = 'Profiles';          Name = 'Save a setup profile to a file';       Run = { Export-SwProfile $Config } }
         @{ Key = '34'; Group = 'Profiles';          Name = 'Load a setup profile from a file';     Run = { Import-SwProfile $Config } }
+        @{ Key = '35'; Group = 'Profiles';          Name = 'Set up a network share for batch setup'; Run = { Set-SwBatchShare $Config } }
         @{ Key = 'R';  Group = 'Finish';            Name = 'Restart the PC';                       Run = { if (Read-SwYesNo 'Restart now?' $false) { Restart-Computer -Force } } }
     )
 }
@@ -851,9 +961,13 @@ function Show-SwMatrixIntro {
 }
 
 function Invoke-SimonwareSetup {
-    Show-SwMatrixIntro
+    param([string]$ProfilePath, [switch]$Unattended)
+
+    $batch = [bool]$ProfilePath
+    if (-not $batch) { Show-SwMatrixIntro }
     if (-not (Test-SwAdmin)) {
-        Write-SwBad 'Please open PowerShell as Administrator and run this again.'
+        Write-SwBad 'Please run this as Administrator and try again.'
+        if ($batch) { Write-SwInfo 'Tip: right-click Run-Setup.cmd and choose "Run as administrator".' }
         return
     }
 
@@ -863,6 +977,18 @@ function Invoke-SimonwareSetup {
     Start-Transcript -Path $log | Out-Null
 
     try {
+        # Batch / network mode: run the full setup from the saved profile, no menu.
+        if ($batch) {
+            Write-SwTitle 'Simonware batch setup'
+            if (-not (Test-Path $ProfilePath)) { Write-SwBad "Profile not found: $ProfilePath"; return }
+            try { $answers = Get-Content -Path $ProfilePath -Raw | ConvertFrom-Json }
+            catch { Write-SwBad 'That profile file is not valid.'; return }
+            Write-SwInfo "Using saved answers from $ProfilePath"
+            Start-SwFullSetup -Config $config -Answers $answers
+            Write-SwGood 'Batch setup finished on this PC.'
+            return
+        }
+
         $menu = Get-SwMenu $config
         while ($true) {
             Show-SwMenu $menu
@@ -881,4 +1007,4 @@ function Invoke-SimonwareSetup {
     }
 }
 
-Invoke-SimonwareSetup
+Invoke-SimonwareSetup -ProfilePath $ProfilePath -Unattended:$Unattended
